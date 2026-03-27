@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+import curses
+import glob
+import math
+import os
+import re
+import time
+from typing import Dict, List, Optional, Tuple
+
+
+REFRESH_SEC = 0.35
+CPUEntry = Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]
+
+
+def read_int(path: str) -> Optional[int]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_text(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def parse_cpu_list(s: str) -> List[int]:
+    out: List[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return sorted(set(out))
+
+
+def get_cpu_dirs() -> List[str]:
+    return sorted(
+        glob.glob("/sys/devices/system/cpu/cpu[0-9]*"),
+        key=lambda p: int(os.path.basename(p)[3:])
+    )
+
+
+def get_cpu_ids(cpu_dirs: List[str]) -> List[int]:
+    return [int(os.path.basename(p)[3:]) for p in cpu_dirs]
+
+
+def get_freq_info(cpu_dir: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    cpufreq_dir = os.path.join(cpu_dir, "cpufreq")
+
+    cur_khz = (
+        read_int(os.path.join(cpufreq_dir, "scaling_cur_freq")) or
+        read_int(os.path.join(cpufreq_dir, "cpuinfo_cur_freq"))
+    )
+    min_khz = (
+        read_int(os.path.join(cpufreq_dir, "scaling_min_freq")) or
+        read_int(os.path.join(cpufreq_dir, "cpuinfo_min_freq"))
+    )
+    max_khz = (
+        read_int(os.path.join(cpufreq_dir, "scaling_max_freq")) or
+        read_int(os.path.join(cpufreq_dir, "cpuinfo_max_freq"))
+    )
+
+    cur_mhz = cur_khz / 1000.0 if cur_khz is not None else None
+    min_mhz = min_khz / 1000.0 if min_khz is not None else None
+    max_mhz = max_khz / 1000.0 if max_khz is not None else None
+    return cur_mhz, min_mhz, max_mhz
+
+
+def format_freq_compact(mhz: Optional[float]) -> str:
+    if mhz is None:
+        return "--.-"
+    return f"{mhz / 1000.0:.1f}"
+
+
+def format_freq_verbose(mhz: Optional[float]) -> str:
+    if mhz is None:
+        return "--.--GHz"
+    return f"{mhz / 1000.0:>4.2f}GHz"
+
+
+def format_util_compact(util: Optional[float]) -> str:
+    if util is None:
+        return "--"
+    val = int(round(util))
+    if val >= 100:
+        return "FU"
+    return f"{max(0, val):>2}"
+
+
+def format_util_verbose(util: Optional[float]) -> str:
+    if util is None:
+        return "---%"
+    val = max(0, min(100, int(round(util))))
+    return f"{val:>3d}%"
+
+
+def read_proc_stat() -> Dict[int, Tuple[int, int]]:
+    stats: Dict[int, Tuple[int, int]] = {}
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith("cpu"):
+                    continue
+                parts = line.split()
+                name = parts[0]
+                if name == "cpu" or not name[3:].isdigit():
+                    continue
+
+                cpu_id = int(name[3:])
+                vals = [int(x) for x in parts[1:]]
+
+                user = vals[0] if len(vals) > 0 else 0
+                nice = vals[1] if len(vals) > 1 else 0
+                system = vals[2] if len(vals) > 2 else 0
+                idle = vals[3] if len(vals) > 3 else 0
+                iowait = vals[4] if len(vals) > 4 else 0
+                irq = vals[5] if len(vals) > 5 else 0
+                softirq = vals[6] if len(vals) > 6 else 0
+                steal = vals[7] if len(vals) > 7 else 0
+
+                idle_all = idle + iowait
+                total = user + nice + system + idle + iowait + irq + softirq + steal
+                stats[cpu_id] = (total, idle_all)
+    except OSError:
+        pass
+    return stats
+
+
+def calc_cpu_usage(
+    prev_stats: Dict[int, Tuple[int, int]],
+    curr_stats: Dict[int, Tuple[int, int]],
+) -> Dict[int, Optional[float]]:
+    usage: Dict[int, Optional[float]] = {}
+    for cpu_id, (curr_total, curr_idle) in curr_stats.items():
+        prev = prev_stats.get(cpu_id)
+        if prev is None:
+            usage[cpu_id] = None
+            continue
+
+        prev_total, prev_idle = prev
+        total_delta = curr_total - prev_total
+        idle_delta = curr_idle - prev_idle
+
+        if total_delta <= 0:
+            usage[cpu_id] = None
+            continue
+
+        util = 100.0 * (1.0 - (idle_delta / total_delta))
+        usage[cpu_id] = max(0.0, min(100.0, util))
+    return usage
+
+
+def init_colors() -> None:
+    curses.start_color()
+    curses.use_default_colors()
+
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.init_pair(5, curses.COLOR_CYAN, -1)
+    curses.init_pair(6, -1, -1)
+    curses.init_pair(7, curses.COLOR_BLUE, -1)
+
+    if curses.COLORS >= 256:
+        try:
+            curses.init_pair(3, 208, -1)
+        except curses.error:
+            pass
+
+
+def usage_color(util: Optional[float]) -> int:
+    if util is None:
+        return curses.color_pair(6)
+    if util < 25:
+        return curses.color_pair(1)
+    if util < 50:
+        return curses.color_pair(2)
+    if util < 75:
+        return curses.color_pair(3)
+    return curses.color_pair(4) | curses.A_BOLD
+
+
+def cpu_label(idx: int) -> str:
+    return f"C{idx}"
+
+
+def compute_label_width(max_cpu_id: int) -> int:
+    return len(cpu_label(max_cpu_id))
+
+
+def get_cell_width(mode: str, label_w: int) -> int:
+    if mode == "ultra":
+        return label_w + 1 + 2 + 1 + 4 + 1
+    if mode == "compact":
+        return label_w + 1 + 2 + 1 + 4 + 1 + 4 + 1
+    return label_w + 1 + 4 + 2 + 8 + 2 + 8 + 1
+
+
+def collect_data(cpu_dirs: List[str], usages: Dict[int, Optional[float]]) -> Dict[int, CPUEntry]:
+    data: Dict[int, CPUEntry] = {}
+    for cpu_dir in cpu_dirs:
+        idx = int(os.path.basename(cpu_dir)[3:])
+        cur, low, high = get_freq_info(cpu_dir)
+        data[idx] = (idx, cur, low, high, usages.get(idx))
+    return data
+
+
+def get_cpu_package_map(cpu_dirs: List[str]) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    for cpu_dir in cpu_dirs:
+        cpu_id = int(os.path.basename(cpu_dir)[3:])
+        pkg = read_int(os.path.join(cpu_dir, "topology", "physical_package_id"))
+        out[cpu_id] = 0 if pkg is None else pkg
+    return out
+
+
+def get_numa_groups(cpu_ids: List[int]) -> List[Tuple[int, List[int]]]:
+    node_dirs = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
+    groups: List[Tuple[int, List[int]]] = []
+
+    for node_dir in node_dirs:
+        m = re.search(r"node(\d+)$", node_dir)
+        if not m:
+            continue
+        node_id = int(m.group(1))
+        cpulist = read_text(os.path.join(node_dir, "cpulist"))
+        if cpulist:
+            groups.append((node_id, parse_cpu_list(cpulist)))
+
+    return groups if groups else [(0, cpu_ids)]
+
+
+def get_socket_numa_tree(cpu_dirs: List[str]) -> List[Tuple[int, List[Tuple[int, List[int]]]]]:
+    cpu_ids = get_cpu_ids(cpu_dirs)
+    package_map = get_cpu_package_map(cpu_dirs)
+    numa_groups = get_numa_groups(cpu_ids)
+
+    sockets: Dict[int, List[Tuple[int, List[int]]]] = {}
+    for node_id, ids in numa_groups:
+        by_socket: Dict[int, List[int]] = {}
+        for cpu_id in ids:
+            pkg = package_map.get(cpu_id, 0)
+            by_socket.setdefault(pkg, []).append(cpu_id)
+
+        for pkg, pkg_ids in by_socket.items():
+            sockets.setdefault(pkg, []).append((node_id, sorted(pkg_ids)))
+
+    if not sockets:
+        return [(0, [(0, cpu_ids)])]
+
+    return [(pkg, sorted(sockets[pkg], key=lambda x: x[0])) for pkg in sorted(sockets)]
+
+
+def compute_avg_util(entries: List[CPUEntry]) -> Optional[float]:
+    vals = [e[4] for e in entries if e[4] is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def compute_avg_freq(entries: List[CPUEntry]) -> Optional[float]:
+    vals = [e[1] for e in entries if e[1] is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def get_cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "CPU"
+
+
+def draw_cell(stdscr, y: int, x: int, entry: CPUEntry, mode: str, label_w: int, max_w: int) -> None:
+    idx, cur, low, high, util = entry
+    label = cpu_label(idx).ljust(label_w)
+    neutral = curses.color_pair(6)
+    uattr = usage_color(util)
+
+    if mode == "ultra":
+        parts = [
+            (label, neutral),
+            (" ", neutral),
+            (format_util_compact(util).rjust(2), uattr),
+            (" ", neutral),
+            (format_freq_compact(cur).rjust(4), neutral),
+        ]
+    elif mode == "compact":
+        parts = [
+            (label, neutral),
+            (" ", neutral),
+            (format_util_compact(util).rjust(2), uattr),
+            (" ", neutral),
+            (format_freq_compact(cur).rjust(4), neutral),
+            (" ", neutral),
+            (format_freq_compact(high).rjust(4), curses.color_pair(5)),
+        ]
+    else:
+        parts = [
+            (label, neutral),
+            (" ", neutral),
+            (format_util_verbose(util).rjust(4), uattr),
+            ("  ", neutral),
+            (format_freq_verbose(cur).rjust(8), neutral),
+            ("  ", neutral),
+            (format_freq_verbose(high).rjust(8), curses.color_pair(5)),
+        ]
+
+    used = 0
+    for text, attr in parts:
+        if used >= max_w:
+            break
+        n = min(len(text), max_w - used)
+        try:
+            stdscr.addnstr(y, x + used, text, n, attr)
+        except curses.error:
+            pass
+        used += n
+
+
+def draw_header(
+    stdscr,
+    w: int,
+    model: str,
+    mode: str,
+    grouping: bool,
+    total_cpus: int,
+    sockets: int,
+    nodes: int,
+    page: int,
+    total_pages: int,
+) -> None:
+    gtxt = "ON" if grouping else "OFF"
+    line0 = f"{model} | CPUs:{total_cpus} Sockets:{sockets} NUMA:{nodes}"
+    line1 = (
+        f"Mode:{mode} Group:{gtxt} Page:{page + 1}/{max(1, total_pages)} "
+        "q quit | arrows page | 1 normal | 2 compact | 3 ultra | 4 grouping"
+    )
+    try:
+        stdscr.addnstr(0, 0, line0, max(1, w - 1), curses.A_BOLD)
+        stdscr.addnstr(1, 0, line1, max(1, w - 1), curses.color_pair(5))
+        stdscr.hline(2, 0, ord("-"), max(1, w - 1))
+    except curses.error:
+        pass
+
+
+def draw_flat_mode(
+    stdscr,
+    mode: str,
+    page: int,
+    data_list: List[CPUEntry],
+    h: int,
+    w: int,
+    label_w: int,
+    model: str,
+    sockets: int,
+    nodes: int,
+):
+    cell_w = get_cell_width(mode, label_w)
+    cols = max(1, w // cell_w)
+
+    header_lines = 3
+    usable_rows = max(1, h - header_lines - 1)
+    per_page = max(1, cols * usable_rows)
+    total = len(data_list)
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, total_pages - 1))
+
+    draw_header(stdscr, w, model, mode, False, total, sockets, nodes, page, total_pages)
+
+    start = page * per_page
+    end = min(start + per_page, total)
+    for i, entry in enumerate(data_list[start:end]):
+        row = i // cols
+        col = i % cols
+        y = 3 + row
+        x = col * cell_w
+        draw_cell(stdscr, y, x, entry, mode, label_w, cell_w - 1)
+
+    try:
+        stdscr.addnstr(h - 1, 0, f"Showing cores {start}-{end - 1}", max(1, w - 1), curses.A_DIM)
+    except curses.error:
+        pass
+
+    return page, total_pages
+
+
+def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, attr: int) -> None:
+    if h < 3 or w < 4:
+        return
+
+    try:
+        stdscr.addch(y, x, curses.ACS_ULCORNER, attr)
+        stdscr.addch(y, x + w - 1, curses.ACS_URCORNER, attr)
+        stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER, attr)
+        stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER, attr)
+
+        for i in range(1, w - 1):
+            stdscr.addch(y, x + i, curses.ACS_HLINE, attr)
+            stdscr.addch(y + h - 1, x + i, curses.ACS_HLINE, attr)
+
+        for i in range(1, h - 1):
+            stdscr.addch(y + i, x, curses.ACS_VLINE, attr)
+            stdscr.addch(y + i, x + w - 1, curses.ACS_VLINE, attr)
+
+        hdr = f" {title} "
+        if len(hdr) < w - 2:
+            stdscr.addnstr(y, x + 2, hdr, w - 4, attr | curses.A_BOLD)
+    except curses.error:
+        pass
+
+
+def layout_socket_pages(
+    mode: str,
+    socket_id: int,
+    node_groups: List[Tuple[int, List[int]]],
+    data_map: Dict[int, CPUEntry],
+    content_w: int,
+    content_h: int,
+    label_w: int,
+):
+    socket_w = max(20, content_w)
+    socket_inner_w = socket_w - 2
+    cell_w = get_cell_width(mode, label_w)
+
+    gap = 1
+    min_box_w = max(cell_w + 2, 18)
+
+    max_cols = min(len(node_groups), max(1, (socket_inner_w + gap) // (min_box_w + gap)))
+    node_cols = 1
+    box_w = min_box_w
+    cpu_cols = 1
+
+    for cols in range(max_cols, 0, -1):
+        candidate_w = (socket_inner_w - gap * (cols - 1)) // cols
+        if candidate_w < min_box_w:
+            continue
+        candidate_cpu_cols = max(1, (candidate_w - 2) // cell_w)
+        node_cols = cols
+        box_w = candidate_w
+        cpu_cols = candidate_cpu_cols
+        break
+
+    rows = []
+    node_boxes = []
+    for node_id, cpu_ids in node_groups:
+        entries = [data_map[c] for c in cpu_ids if c in data_map]
+        cpu_rows = max(1, math.ceil(len(entries) / cpu_cols))
+        title = f"NUMA {node_id} | {format_util_compact(compute_avg_util(entries))} | {format_freq_compact(compute_avg_freq(entries))}"
+        node_boxes.append(
+            {
+                "node_id": node_id,
+                "title": title,
+                "entries": entries,
+                "box_w": box_w,
+                "box_h": cpu_rows + 2,
+                "cpu_cols": cpu_cols,
+            }
+        )
+
+    for i in range(0, len(node_boxes), node_cols):
+        boxes = node_boxes[i:i + node_cols]
+        rows.append({"boxes": boxes, "row_h": max(box["box_h"] for box in boxes)})
+
+    pages = []
+    inner_h_avail = max(1, content_h - 2)
+    current_rows = []
+    used = 0
+
+    for row in rows:
+        if current_rows and used + row["row_h"] > inner_h_avail:
+            pages.append(current_rows)
+            current_rows = []
+            used = 0
+        current_rows.append(row)
+        used += row["row_h"]
+
+    if current_rows:
+        pages.append(current_rows)
+
+    if not pages:
+        pages = [[]]
+
+    segments = []
+    total_segments = len(pages)
+    for i, segment_rows in enumerate(pages, 1):
+        segments.append(
+            {
+                "socket_id": socket_id,
+                "segment_index": i,
+                "segment_total": total_segments,
+                "socket_w": socket_w,
+                "rows": segment_rows,
+                "node_gap": gap,
+            }
+        )
+    return segments
+
+
+def build_group_pages(
+    mode: str,
+    tree,
+    data_map: Dict[int, CPUEntry],
+    term_h: int,
+    term_w: int,
+    label_w: int,
+):
+    header_lines = 3
+    footer_lines = 1
+    content_h = max(5, term_h - header_lines - footer_lines)
+    content_w = max(20, term_w - 1)
+
+    pages = []
+    for socket_id, node_groups in tree:
+        pages.extend(layout_socket_pages(mode, socket_id, node_groups, data_map, content_w, content_h, label_w))
+
+    if not pages:
+        pages = [
+            {
+                "socket_id": 0,
+                "segment_index": 1,
+                "segment_total": 1,
+                "socket_w": content_w,
+                "rows": [],
+                "node_gap": 1,
+            }
+        ]
+    return pages
+
+def segment_height(segment: dict) -> int:
+    return 2 + sum(row["row_h"] for row in segment["rows"])
+
+def build_group_pages(
+    mode: str,
+    tree,
+    data_map: Dict[int, CPUEntry],
+    term_h: int,
+    term_w: int,
+    label_w: int,
+):
+    header_lines = 3
+    footer_lines = 1
+    content_h = max(5, term_h - header_lines - footer_lines)
+    content_w = max(20, term_w - 1)
+
+    # First split each socket into as many segments as needed.
+    all_segments = []
+    for socket_id, node_groups in tree:
+        socket_segments = layout_socket_pages(
+            mode,
+            socket_id,
+            node_groups,
+            data_map,
+            content_w,
+            content_h,
+            label_w,
+        )
+        all_segments.extend(socket_segments)
+
+    # Then pack as many socket segments as possible onto each page.
+    pages: List[List[dict]] = []
+    current_page: List[dict] = []
+    used_h = 0
+
+    for seg in all_segments:
+        seg_h = segment_height(seg)
+
+        # Safety clamp. layout_socket_pages should already ensure this.
+        seg_h = min(seg_h, content_h)
+
+        if current_page and used_h + seg_h > content_h:
+            pages.append(current_page)
+            current_page = []
+            used_h = 0
+
+        current_page.append(seg)
+        used_h += seg_h
+
+    if current_page:
+        pages.append(current_page)
+
+    if not pages:
+        pages = [[]]
+
+    return pages
+
+
+def draw_grouped_mode(
+    stdscr,
+    mode: str,
+    page: int,
+    data_map: Dict[int, CPUEntry],
+    tree,
+    h: int,
+    w: int,
+    label_w: int,
+    model: str,
+    sockets: int,
+    nodes: int,
+):
+    pages = build_group_pages(mode, tree, data_map, h, w, label_w)
+    total_pages = max(1, len(pages))
+    page = max(0, min(page, total_pages - 1))
+    page_segments = pages[page]
+
+    draw_header(
+        stdscr,
+        w,
+        model,
+        mode,
+        True,
+        len(data_map),
+        sockets,
+        nodes,
+        page,
+        total_pages,
+    )
+
+    y = 3
+    cell_w = get_cell_width(mode, label_w)
+
+    for seg in page_segments:
+        seg_h = segment_height(seg)
+
+        # Never render beyond the visible window.
+        if y + seg_h > h - 1:
+            break
+
+        socket_title = f"SOCKET {seg['socket_id']} ({seg['segment_index']}/{seg['segment_total']})"
+        draw_box(
+            stdscr,
+            y,
+            0,
+            seg_h,
+            seg["socket_w"],
+            socket_title,
+            curses.color_pair(5) | curses.A_BOLD,
+        )
+
+        inner_y = y + 1
+        gap = seg["node_gap"]
+
+        for row in seg["rows"]:
+            row_h = row["row_h"]
+            x = 1
+
+            for box in row["boxes"]:
+                bw = box["box_w"]
+
+                # Never render a NUMA box outside the current socket box.
+                if x + bw > seg["socket_w"] - 1:
+                    break
+
+                draw_box(
+                    stdscr,
+                    inner_y,
+                    x,
+                    row_h,
+                    bw,
+                    box["title"],
+                    curses.color_pair(7) | curses.A_BOLD,
+                )
+
+                for i, entry in enumerate(box["entries"]):
+                    cpu_row = i // box["cpu_cols"]
+                    cpu_col = i % box["cpu_cols"]
+                    cy = inner_y + 1 + cpu_row
+                    cx = x + 1 + cpu_col * cell_w
+
+                    if cy >= inner_y + row_h - 1:
+                        break
+                    if cx >= x + bw - 1:
+                        break
+
+                    draw_cell(
+                        stdscr,
+                        cy,
+                        cx,
+                        entry,
+                        mode,
+                        label_w,
+                        min(cell_w - 1, x + bw - 1 - cx),
+                    )
+
+                x += bw + gap
+
+            inner_y += row_h
+            if inner_y >= y + seg_h - 1:
+                break
+
+        y += seg_h
+        if y >= h - 1:
+            break
+
+    socket_ids = sorted({seg["socket_id"] for seg in page_segments})
+    socket_txt = ",".join(str(s) for s in socket_ids) if socket_ids else "-"
+    footer = f"Grouped by socket -> NUMA -> core | sockets on page: {socket_txt}"
+
+    try:
+        stdscr.addnstr(h - 1, 0, footer, max(1, w - 1), curses.A_DIM)
+    except curses.error:
+        pass
+
+    return page, total_pages
+
+def draw_screen(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(50)
+    init_colors()
+
+    cpu_dirs = get_cpu_dirs()
+    if not cpu_dirs:
+        return
+
+    cpu_ids = get_cpu_ids(cpu_dirs)
+    max_cpu_id = max(cpu_ids) if cpu_ids else 0
+    label_w = compute_label_width(max_cpu_id)
+    tree = get_socket_numa_tree(cpu_dirs)
+    model = get_cpu_model()
+    sockets = len(tree)
+    nodes = sum(len(node_groups) for _, node_groups in tree)
+
+    mode = "ultra"
+    grouping = True
+    page = 0
+
+    prev_stats = read_proc_stat()
+    usages: Dict[int, Optional[float]] = {cpu_id: None for cpu_id in cpu_ids}
+    data_map: Dict[int, CPUEntry] = {}
+    data_list: List[CPUEntry] = []
+    last_refresh = 0.0
+
+    while True:
+        now = time.monotonic()
+        if now - last_refresh >= REFRESH_SEC:
+            curr_stats = read_proc_stat()
+            usages = calc_cpu_usage(prev_stats, curr_stats)
+            prev_stats = curr_stats
+            data_map = collect_data(cpu_dirs, usages)
+            data_list = [data_map[k] for k in sorted(data_map)]
+            last_refresh = now
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        if grouping:
+            page, total_pages = draw_grouped_mode(stdscr, mode, page, data_map, tree, h, w, label_w, model, sockets, nodes)
+        else:
+            page, total_pages = draw_flat_mode(stdscr, mode, page, data_list, h, w, label_w, model, sockets, nodes)
+
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (ord("q"), ord("Q")):
+            break
+        elif ch == curses.KEY_RIGHT and page < total_pages - 1:
+            page += 1
+        elif ch == curses.KEY_LEFT and page > 0:
+            page -= 1
+        elif ch == ord("1"):
+            mode = "normal"
+            page = 0
+        elif ch == ord("2"):
+            mode = "compact"
+            page = 0
+        elif ch == ord("3"):
+            mode = "ultra"
+            page = 0
+        elif ch == ord("4"):
+            grouping = not grouping
+            page = 0
+
+
+def main():
+    if not get_cpu_dirs():
+        print("No CPU cores found under /sys/devices/system/cpu/")
+        raise SystemExit(1)
+
+    curses.wrapper(draw_screen)
+
+
+if __name__ == "__main__":
+    main()
