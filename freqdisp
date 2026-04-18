@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
+import argparse
 import curses
 import glob
+import json
 import math
 import os
 import re
+import subprocess
+import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
 
+APP_NAME = "freqdisp"
 REFRESH_SEC = 0.35
+DEFAULT_MODE = "ultra"
+DEFAULT_GROUPING = True
+VALID_MODES = {"normal", "compact", "ultra"}
+CONFIG_FILENAME = ".freqdisp.json"
+VERSION_FILENAME = "VERSION"
 CPUEntry = Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]
 
 
@@ -26,6 +36,102 @@ def read_text(path: str) -> Optional[str]:
             return f.read().strip()
     except OSError:
         return None
+
+
+def get_install_dir() -> str:
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def get_config_path() -> str:
+    return os.path.join(get_install_dir(), CONFIG_FILENAME)
+
+
+def get_version_path() -> str:
+    return os.path.join(get_install_dir(), VERSION_FILENAME)
+
+
+def normalize_mode(mode: Optional[str]) -> str:
+    if mode in VALID_MODES:
+        return mode
+    return DEFAULT_MODE
+
+
+def load_config() -> Tuple[str, bool]:
+    raw = read_text(get_config_path())
+    if not raw:
+        return DEFAULT_MODE, DEFAULT_GROUPING
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return DEFAULT_MODE, DEFAULT_GROUPING
+
+    if not isinstance(data, dict):
+        return DEFAULT_MODE, DEFAULT_GROUPING
+
+    mode = normalize_mode(data.get("mode"))
+    grouping = data.get("grouping")
+    if not isinstance(grouping, bool):
+        grouping = DEFAULT_GROUPING
+    return mode, grouping
+
+
+def write_text_atomic(path: str, text: str) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".freqdisp.", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def save_config(mode: str, grouping: bool) -> None:
+    payload = {
+        "grouping": grouping,
+        "mode": normalize_mode(mode),
+    }
+    try:
+        write_text_atomic(
+            get_config_path(),
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        )
+    except OSError:
+        pass
+
+
+def get_git_version() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=get_install_dir(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    version = result.stdout.strip()
+    if result.returncode != 0 or not version:
+        return None
+    return version
+
+
+def get_app_version() -> str:
+    version = read_text(get_version_path())
+    if version:
+        return version
+
+    version = get_git_version()
+    if version:
+        return version
+
+    return "unknown"
 
 
 def parse_cpu_list(s: str) -> List[int]:
@@ -333,6 +439,7 @@ def draw_header(
     stdscr,
     w: int,
     model: str,
+    version: str,
     mode: str,
     grouping: bool,
     total_cpus: int,
@@ -342,7 +449,7 @@ def draw_header(
     total_pages: int,
 ) -> None:
     gtxt = "ON" if grouping else "OFF"
-    line0 = f"{model} | CPUs:{total_cpus} Sockets:{sockets} NUMA:{nodes}"
+    line0 = f"{model} | CPUs:{total_cpus} Sockets:{sockets} NUMA:{nodes} | Ver:{version}"
     line1 = (
         f"Mode:{mode} Group:{gtxt} Page:{page + 1}/{max(1, total_pages)} "
         "q quit | arrows page | 1 normal | 2 compact | 3 ultra | 4 grouping"
@@ -364,6 +471,7 @@ def draw_flat_mode(
     w: int,
     label_w: int,
     model: str,
+    version: str,
     sockets: int,
     nodes: int,
 ):
@@ -377,7 +485,7 @@ def draw_flat_mode(
     total_pages = max(1, math.ceil(total / per_page))
     page = max(0, min(page, total_pages - 1))
 
-    draw_header(stdscr, w, model, mode, False, total, sockets, nodes, page, total_pages)
+    draw_header(stdscr, w, model, version, mode, False, total, sockets, nodes, page, total_pages)
 
     start = page * per_page
     end = min(start + per_page, total)
@@ -508,36 +616,6 @@ def layout_socket_pages(
     return segments
 
 
-def build_group_pages(
-    mode: str,
-    tree,
-    data_map: Dict[int, CPUEntry],
-    term_h: int,
-    term_w: int,
-    label_w: int,
-):
-    header_lines = 3
-    footer_lines = 1
-    content_h = max(5, term_h - header_lines - footer_lines)
-    content_w = max(20, term_w - 1)
-
-    pages = []
-    for socket_id, node_groups in tree:
-        pages.extend(layout_socket_pages(mode, socket_id, node_groups, data_map, content_w, content_h, label_w))
-
-    if not pages:
-        pages = [
-            {
-                "socket_id": 0,
-                "segment_index": 1,
-                "segment_total": 1,
-                "socket_w": content_w,
-                "rows": [],
-                "node_gap": 1,
-            }
-        ]
-    return pages
-
 def segment_height(segment: dict) -> int:
     return 2 + sum(row["row_h"] for row in segment["rows"])
 
@@ -606,6 +684,7 @@ def draw_grouped_mode(
     w: int,
     label_w: int,
     model: str,
+    version: str,
     sockets: int,
     nodes: int,
 ):
@@ -618,6 +697,7 @@ def draw_grouped_mode(
         stdscr,
         w,
         model,
+        version,
         mode,
         True,
         len(data_map),
@@ -714,7 +794,7 @@ def draw_grouped_mode(
 
     return page, total_pages
 
-def draw_screen(stdscr):
+def draw_screen(stdscr, version: str):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(50)
@@ -732,8 +812,7 @@ def draw_screen(stdscr):
     sockets = len(tree)
     nodes = sum(len(node_groups) for _, node_groups in tree)
 
-    mode = "ultra"
-    grouping = True
+    mode, grouping = load_config()
     page = 0
 
     prev_stats = read_proc_stat()
@@ -756,9 +835,9 @@ def draw_screen(stdscr):
         h, w = stdscr.getmaxyx()
 
         if grouping:
-            page, total_pages = draw_grouped_mode(stdscr, mode, page, data_map, tree, h, w, label_w, model, sockets, nodes)
+            page, total_pages = draw_grouped_mode(stdscr, mode, page, data_map, tree, h, w, label_w, model, version, sockets, nodes)
         else:
-            page, total_pages = draw_flat_mode(stdscr, mode, page, data_list, h, w, label_w, model, sockets, nodes)
+            page, total_pages = draw_flat_mode(stdscr, mode, page, data_list, h, w, label_w, model, version, sockets, nodes)
 
         stdscr.refresh()
 
@@ -772,23 +851,36 @@ def draw_screen(stdscr):
         elif ch == ord("1"):
             mode = "normal"
             page = 0
+            save_config(mode, grouping)
         elif ch == ord("2"):
             mode = "compact"
             page = 0
+            save_config(mode, grouping)
         elif ch == ord("3"):
             mode = "ultra"
             page = 0
+            save_config(mode, grouping)
         elif ch == ord("4"):
             grouping = not grouping
             page = 0
+            save_config(mode, grouping)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Display CPU frequency and usage in the terminal.")
+    parser.add_argument("--version", action="store_true", help="Show version and exit.")
+    args = parser.parse_args()
+
+    version = get_app_version()
+    if args.version:
+        print(f"{APP_NAME} {version}")
+        return
+
     if not get_cpu_dirs():
         print("No CPU cores found under /sys/devices/system/cpu/")
         raise SystemExit(1)
 
-    curses.wrapper(draw_screen)
+    curses.wrapper(lambda stdscr: draw_screen(stdscr, version))
 
 
 if __name__ == "__main__":
