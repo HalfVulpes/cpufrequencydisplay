@@ -32,6 +32,11 @@ The installer defaults to:
 - launcher: `~/.local/bin/freqdisp`
 - config file: `~/.local/share/freqdisp/.freqdisp.json`
 
+It also adds `~/.local/bin` to your shell PATH automatically. For Bash it updates
+`~/.bashrc` and `~/.profile`; for Zsh it updates `~/.zshrc` and `~/.zprofile`;
+other shells use `~/.profile`. New terminals pick up the change automatically,
+and sourced installs update the current shell immediately.
+
 The app saves your current `mode` and `grouping` choice whenever you press `1`, `2`, `3`, or `4`, then restores those settings on the next launch.
 
 ## Versioning

@@ -9,6 +9,10 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 TARGET_SCRIPT="$INSTALL_DIR/$APP_NAME"
 TARGET_LINK="$BIN_DIR/$APP_NAME"
 TARGET_VERSION="$INSTALL_DIR/VERSION"
+PATH_MARKER_BEGIN="# >>> freqdisp PATH >>>"
+PATH_MARKER_END="# <<< freqdisp PATH <<<"
+PATH_PROFILE_CANDIDATES=()
+UPDATED_PATH_PROFILES=()
 
 
 log() {
@@ -105,6 +109,168 @@ get_remote_ref() {
 }
 
 
+is_sourced() {
+    [ "${BASH_SOURCE[0]}" != "$0" ]
+}
+
+
+shell_single_quote() {
+    local value="$1"
+
+    printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
+
+
+path_bin_assignment() {
+    local default_assignment="FREQDISP_BIN_DIR=\"\$HOME/.local/bin\""
+
+    if [ "$BIN_DIR" = "$HOME/.local/bin" ]; then
+        printf '%s' "$default_assignment"
+        return
+    fi
+
+    printf 'FREQDISP_BIN_DIR=%s' "$(shell_single_quote "$BIN_DIR")"
+}
+
+
+write_path_block() {
+    local case_start="case \":\$PATH:\" in"
+    local case_found="    *\":\$FREQDISP_BIN_DIR:\"*) ;;"
+    local case_missing="    *) export PATH=\"\$FREQDISP_BIN_DIR:\$PATH\" ;;"
+
+    printf '%s\n' "$PATH_MARKER_BEGIN"
+    printf '%s\n' "# Added by the freqdisp installer; remove this block if you manage PATH elsewhere."
+    path_bin_assignment
+    printf '\n'
+    printf '%s\n' "$case_start"
+    printf '%s\n' "$case_found"
+    printf '%s\n' "$case_missing"
+    printf '%s\n' 'esac'
+    printf '%s\n' 'unset FREQDISP_BIN_DIR'
+    printf '%s\n' "$PATH_MARKER_END"
+}
+
+
+add_profile_candidate() {
+    local candidate="$1"
+    local existing
+
+    [ -n "$candidate" ] || return
+
+    for existing in "${PATH_PROFILE_CANDIDATES[@]}"; do
+        [ "$existing" = "$candidate" ] && return
+    done
+
+    PATH_PROFILE_CANDIDATES+=("$candidate")
+}
+
+
+collect_path_profiles() {
+    local shell_name="${SHELL:-}"
+
+    PATH_PROFILE_CANDIDATES=()
+    shell_name="${shell_name##*/}"
+
+    case "$shell_name" in
+        bash)
+            add_profile_candidate "$HOME/.bashrc"
+            add_profile_candidate "$HOME/.profile"
+            ;;
+        zsh)
+            add_profile_candidate "$HOME/.zshrc"
+            add_profile_candidate "$HOME/.zprofile"
+            ;;
+        *)
+            add_profile_candidate "$HOME/.profile"
+            ;;
+    esac
+}
+
+
+profile_has_path_entry() {
+    local profile="$1"
+    local default_home_expr="\$HOME/.local/bin"
+    local default_tilde_expr="~"
+
+    default_tilde_expr="$default_tilde_expr/.local/bin"
+
+    [ -f "$profile" ] || return 1
+
+    grep -F "$PATH_MARKER_BEGIN" "$profile" >/dev/null 2>&1 && return 0
+    grep -F "$BIN_DIR" "$profile" >/dev/null 2>&1 && return 0
+
+    if [ "$BIN_DIR" = "$HOME/.local/bin" ]; then
+        grep -F "$default_home_expr" "$profile" >/dev/null 2>&1 && return 0
+        grep -F "$default_tilde_expr" "$profile" >/dev/null 2>&1 && return 0
+    fi
+
+    return 1
+}
+
+
+ensure_profile_path() {
+    local profile="$1"
+    local profile_dir
+
+    profile_dir="$(dirname "$profile")"
+    mkdir -p "$profile_dir"
+    touch "$profile"
+
+    if profile_has_path_entry "$profile"; then
+        log "PATH already configured in: $profile"
+        return
+    fi
+
+    {
+        printf '\n'
+        write_path_block
+    } >> "$profile"
+
+    UPDATED_PATH_PROFILES+=("$profile")
+    log "Added $BIN_DIR to PATH in: $profile"
+}
+
+
+refresh_current_path() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*)
+            log "Current PATH already includes: $BIN_DIR"
+            ;;
+        *)
+            export PATH="$BIN_DIR:$PATH"
+            if is_sourced; then
+                log "Current shell PATH now includes: $BIN_DIR"
+            else
+                log "Current installer PATH now includes: $BIN_DIR"
+            fi
+            ;;
+    esac
+}
+
+
+ensure_user_path() {
+    local profile
+
+    UPDATED_PATH_PROFILES=()
+
+    if [ "${FREQDISP_SKIP_PATH_UPDATE:-}" = "1" ]; then
+        log "Skipping PATH update because FREQDISP_SKIP_PATH_UPDATE=1"
+        return
+    fi
+
+    collect_path_profiles
+    for profile in "${PATH_PROFILE_CANDIDATES[@]}"; do
+        ensure_profile_path "$profile"
+    done
+
+    refresh_current_path
+
+    if [ "${#UPDATED_PATH_PROFILES[@]}" -gt 0 ]; then
+        log "New terminals will load the updated PATH automatically."
+    fi
+}
+
+
 main() {
     local local_source=""
     local version=""
@@ -132,20 +298,14 @@ main() {
 
     printf '%s\n' "$version" > "$TARGET_VERSION"
     ln -sfn "$TARGET_SCRIPT" "$TARGET_LINK"
+    ensure_user_path
 
     log "Installed script: $TARGET_SCRIPT"
     log "Launcher: $TARGET_LINK"
     log "Config file: $INSTALL_DIR/.freqdisp.json"
     log "Version: $version"
-
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            log "Add $BIN_DIR to PATH if you want to launch '$APP_NAME' without the full path."
-            ;;
-    esac
-
-    log "Run: $TARGET_LINK"
+    log "Run now: $TARGET_LINK"
+    log "Run from PATH: $APP_NAME"
 }
 
 
