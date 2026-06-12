@@ -1,13 +1,31 @@
 # CPU frequency display
 
-Terminal CPU frequency and usage display for Linux systems, with layout support for large core-count and NUMA-heavy machines.
+Terminal CPU frequency and usage display for Debian, Proxmox VE, Fedora, macOS, and FreeBSD systems, with layout support for large core-count and NUMA-heavy Linux machines.
+
+## Supported platforms
+
+- Debian, Proxmox VE, Fedora, and other Linux systems: CPU usage comes from `/proc/stat`; frequency comes from cpufreq sysfs with `/proc/cpuinfo` fallback for virtualized hosts such as PVE.
+- macOS: CPU count/model/frequency comes from `sysctl`, and usage comes from Mach CPU counters. Some Apple Silicon systems do not expose live CPU frequency, so frequency may display as unknown while usage still works.
+- FreeBSD: CPU count, frequency, and usage come from `sysctl`. FreeBSD topology is shown as one socket/NUMA group unless richer topology data is added later.
 
 ## Quick start
 
-- via bash (fire-and-forget)
+- via `curl`
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh)
+curl -fsSL https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh | sh
+```
+
+- via `wget`
+
+```bash
+wget -qO- https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh | sh
+```
+
+- via FreeBSD `fetch`
+
+```sh
+fetch -q -o - https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh | sh
 ```
 
 - via `curl` to download then run
@@ -34,8 +52,8 @@ The installer defaults to:
 
 It also adds `~/.local/bin` to your shell PATH automatically. For Bash it updates
 `~/.bashrc` and `~/.profile`; for Zsh it updates `~/.zshrc` and `~/.zprofile`;
-other shells use `~/.profile`. New terminals pick up the change automatically,
-and sourced installs update the current shell immediately.
+for Csh/Tcsh it updates `~/.cshrc`; other POSIX shells use `~/.profile`. New
+terminals pick up the change automatically.
 
 The app saves your current `mode` and `grouping` choice whenever you press `1`, `2`, `3`, or `4`, then restores those settings on the next launch.
 
@@ -48,7 +66,7 @@ The app saves your current `mode` and `grouping` choice whenever you press `1`, 
 By default, `install.sh` installs the latest git tag when one exists. You can override that with:
 
 ```bash
-FREQDISP_REF=master bash <(curl -fsSL https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh)
+curl -fsSL https://raw.githubusercontent.com/HalfVulpes/cpufrequencydisplay/master/install.sh | FREQDISP_REF=master sh
 ```
 
 ## Manual run

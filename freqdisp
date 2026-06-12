@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
+import ctypes.util
 import curses
 import glob
 import json
 import math
 import os
+import platform
 import re
 import subprocess
 import tempfile
@@ -19,6 +22,8 @@ DEFAULT_GROUPING = True
 VALID_MODES = {"normal", "compact", "ultra"}
 CONFIG_FILENAME = ".freqdisp.json"
 VERSION_FILENAME = "VERSION"
+FreqInfo = Tuple[Optional[float], Optional[float], Optional[float]]
+CPUStats = Dict[int, Tuple[int, int]]
 CPUEntry = Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]
 
 
@@ -134,33 +139,180 @@ def get_app_version() -> str:
     return "unknown"
 
 
+def run_command(args: List[str], timeout: float = 1.0) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def get_system_name() -> str:
+    return platform.system().lower()
+
+
+def parse_first_int(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+
+    match = re.search(r"-?\d+", text)
+    if not match:
+        return None
+
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def sysctl_value(name: str) -> Optional[str]:
+    return run_command(["sysctl", "-n", name])
+
+
+def sysctl_int(name: str) -> Optional[int]:
+    return parse_first_int(sysctl_value(name))
+
+
 def parse_cpu_list(s: str) -> List[int]:
     out: List[int] = []
     for part in s.split(","):
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            out.extend(range(int(a), int(b) + 1))
-        else:
-            out.append(int(part))
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                start = int(a)
+                end = int(b)
+                if end >= start:
+                    out.extend(range(start, end + 1))
+            else:
+                out.append(int(part))
+        except ValueError:
+            continue
     return sorted(set(out))
 
 
-def get_cpu_dirs() -> List[str]:
-    return sorted(
-        glob.glob("/sys/devices/system/cpu/cpu[0-9]*"),
-        key=lambda p: int(os.path.basename(p)[3:])
-    )
+def cpu_dir_id(path: str) -> int:
+    try:
+        return int(os.path.basename(path)[3:])
+    except ValueError:
+        return 0
 
 
-def get_cpu_ids(cpu_dirs: List[str]) -> List[int]:
-    return [int(os.path.basename(p)[3:]) for p in cpu_dirs]
+def get_linux_cpu_dirs() -> List[str]:
+    return sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*"), key=cpu_dir_id)
 
 
-def get_freq_info(cpu_dir: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    cpufreq_dir = os.path.join(cpu_dir, "cpufreq")
+def parse_linux_cpuinfo() -> Tuple[List[int], Dict[int, float], Dict[int, int], Optional[str]]:
+    cpu_ids = set()
+    freqs: Dict[int, float] = {}
+    packages: Dict[int, int] = {}
+    model: Optional[str] = None
+    cpu_id: Optional[int] = None
+
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or ":" not in line:
+                    continue
+
+                key, value = [part.strip() for part in line.split(":", 1)]
+                key_lower = key.lower()
+
+                if key_lower == "processor":
+                    try:
+                        cpu_id = int(value)
+                        cpu_ids.add(cpu_id)
+                    except ValueError:
+                        cpu_id = None
+                        if value and model is None:
+                            model = value
+                elif key_lower == "cpu mhz" and cpu_id is not None:
+                    try:
+                        freqs[cpu_id] = float(value)
+                    except ValueError:
+                        pass
+                elif key_lower == "physical id" and cpu_id is not None:
+                    try:
+                        packages[cpu_id] = int(value)
+                    except ValueError:
+                        pass
+                elif key_lower in ("model name", "hardware", "processor") and value and model is None:
+                    model = value
+    except OSError:
+        pass
+
+    return sorted(cpu_ids), freqs, packages, model
+
+
+def get_linux_cpu_ids() -> List[int]:
+    online = read_text("/sys/devices/system/cpu/online")
+    if online:
+        ids = parse_cpu_list(online)
+        if ids:
+            return ids
+
+    cpu_dirs = get_linux_cpu_dirs()
+    if cpu_dirs:
+        return [cpu_dir_id(path) for path in cpu_dirs]
+
+    cpu_ids, _, _, _ = parse_linux_cpuinfo()
+    return cpu_ids
+
+
+def get_cpu_count_from_sysctl(*names: str) -> Optional[int]:
+    for name in names:
+        count = sysctl_int(name)
+        if count and count > 0:
+            return count
+    return None
+
+
+def get_cpu_ids() -> List[int]:
+    system = get_system_name()
+
+    if system == "linux":
+        return get_linux_cpu_ids()
+
+    if system == "darwin":
+        count = get_cpu_count_from_sysctl("hw.logicalcpu", "hw.ncpu")
+        return list(range(count)) if count else []
+
+    if system == "freebsd":
+        count = get_cpu_count_from_sysctl("hw.ncpu")
+        return list(range(count)) if count else []
+
+    count = os.cpu_count() or 0
+    return list(range(count))
+
+
+def read_linux_available_freqs(cpufreq_dir: str) -> List[int]:
+    raw = read_text(os.path.join(cpufreq_dir, "scaling_available_frequencies"))
+    if not raw:
+        return []
+
+    out = []
+    for part in raw.split():
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def get_linux_freq_info(cpu_id: int, cpuinfo_freqs: Dict[int, float]) -> FreqInfo:
+    cpufreq_dir = f"/sys/devices/system/cpu/cpu{cpu_id}/cpufreq"
 
     cur_khz = (
         read_int(os.path.join(cpufreq_dir, "scaling_cur_freq")) or
@@ -175,10 +327,82 @@ def get_freq_info(cpu_dir: str) -> Tuple[Optional[float], Optional[float], Optio
         read_int(os.path.join(cpufreq_dir, "cpuinfo_max_freq"))
     )
 
-    cur_mhz = cur_khz / 1000.0 if cur_khz is not None else None
+    available = read_linux_available_freqs(cpufreq_dir)
+    if available:
+        min_khz = min_khz or min(available)
+        max_khz = max_khz or max(available)
+
+    cur_mhz = cur_khz / 1000.0 if cur_khz is not None else cpuinfo_freqs.get(cpu_id)
     min_mhz = min_khz / 1000.0 if min_khz is not None else None
     max_mhz = max_khz / 1000.0 if max_khz is not None else None
     return cur_mhz, min_mhz, max_mhz
+
+
+def mhz_from_hz(value: Optional[int]) -> Optional[float]:
+    return value / 1_000_000.0 if value is not None and value > 0 else None
+
+
+def freq_from_model_string(model: Optional[str]) -> Optional[float]:
+    if not model:
+        return None
+
+    match = re.search(r"@\s*([0-9]+(?:\.[0-9]+)?)\s*([GM])Hz", model, re.IGNORECASE)
+    if not match:
+        return None
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    return value * 1000.0 if unit == "g" else value
+
+
+def get_darwin_freq_info() -> FreqInfo:
+    cur_mhz = mhz_from_hz(sysctl_int("hw.cpufrequency"))
+    min_mhz = mhz_from_hz(sysctl_int("hw.cpufrequency_min"))
+    max_mhz = mhz_from_hz(sysctl_int("hw.cpufrequency_max"))
+
+    nominal_mhz = freq_from_model_string(sysctl_value("machdep.cpu.brand_string"))
+    cur_mhz = cur_mhz or nominal_mhz
+    max_mhz = max_mhz or nominal_mhz or cur_mhz
+    return cur_mhz, min_mhz, max_mhz
+
+
+def parse_freebsd_freq_levels(raw: Optional[str]) -> List[int]:
+    if not raw:
+        return []
+
+    levels = []
+    for part in raw.split():
+        match = re.match(r"^(\d+)(?:/\d+)?$", part)
+        if match:
+            levels.append(int(match.group(1)))
+    return levels
+
+
+def get_freebsd_freq_info(cpu_id: int) -> FreqInfo:
+    cur_mhz_int = sysctl_int(f"dev.cpu.{cpu_id}.freq") or sysctl_int("hw.clockrate")
+    levels = parse_freebsd_freq_levels(sysctl_value(f"dev.cpu.{cpu_id}.freq_levels"))
+
+    cur_mhz = float(cur_mhz_int) if cur_mhz_int is not None else None
+    min_mhz = float(min(levels)) if levels else None
+    max_mhz = float(max(levels)) if levels else None
+    return cur_mhz, min_mhz, max_mhz
+
+
+def get_all_freq_info(cpu_ids: List[int]) -> Dict[int, FreqInfo]:
+    system = get_system_name()
+
+    if system == "linux":
+        _, cpuinfo_freqs, _, _ = parse_linux_cpuinfo()
+        return {cpu_id: get_linux_freq_info(cpu_id, cpuinfo_freqs) for cpu_id in cpu_ids}
+
+    if system == "darwin":
+        freq_info = get_darwin_freq_info()
+        return {cpu_id: freq_info for cpu_id in cpu_ids}
+
+    if system == "freebsd":
+        return {cpu_id: get_freebsd_freq_info(cpu_id) for cpu_id in cpu_ids}
+
+    return {cpu_id: (None, None, None) for cpu_id in cpu_ids}
 
 
 def format_freq_compact(mhz: Optional[float]) -> str:
@@ -209,8 +433,8 @@ def format_util_verbose(util: Optional[float]) -> str:
     return f"{val:>3d}%"
 
 
-def read_proc_stat() -> Dict[int, Tuple[int, int]]:
-    stats: Dict[int, Tuple[int, int]] = {}
+def read_linux_cpu_stats() -> CPUStats:
+    stats: CPUStats = {}
     try:
         with open("/proc/stat", "r", encoding="utf-8") as f:
             for line in f:
@@ -241,9 +465,110 @@ def read_proc_stat() -> Dict[int, Tuple[int, int]]:
     return stats
 
 
+def read_darwin_cpu_stats() -> CPUStats:
+    stats: CPUStats = {}
+    info = None
+    info_count = ctypes.c_uint(0)
+
+    try:
+        lib_name = ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib"
+        libc = ctypes.CDLL(lib_name)
+
+        processor_count = ctypes.c_uint(0)
+        info = ctypes.POINTER(ctypes.c_int)()
+
+        host_processor_info = libc.host_processor_info
+        host_processor_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        host_processor_info.restype = ctypes.c_int
+
+        mach_host_self = libc.mach_host_self
+        mach_host_self.restype = ctypes.c_uint
+
+        ret = host_processor_info(
+            mach_host_self(),
+            2,  # PROCESSOR_CPU_LOAD_INFO
+            ctypes.byref(processor_count),
+            ctypes.byref(info),
+            ctypes.byref(info_count),
+        )
+        if ret != 0 or not info:
+            return {}
+
+        for cpu_id in range(processor_count.value):
+            base = cpu_id * 4
+            user = int(info[base])
+            system = int(info[base + 1])
+            idle = int(info[base + 2])
+            nice = int(info[base + 3])
+            total = user + system + idle + nice
+            stats[cpu_id] = (total, idle)
+    except (OSError, AttributeError, ValueError, TypeError):
+        return {}
+    finally:
+        if info:
+            try:
+                vm_deallocate = libc.vm_deallocate
+                vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
+                vm_deallocate.restype = ctypes.c_int
+                try:
+                    task = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+                except ValueError:
+                    mach_task_self = libc.mach_task_self
+                    mach_task_self.restype = ctypes.c_uint
+                    task = mach_task_self()
+                vm_deallocate(
+                    task,
+                    ctypes.cast(info, ctypes.c_void_p),
+                    info_count.value * ctypes.sizeof(ctypes.c_int),
+                )
+            except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError):
+                pass
+
+    return stats
+
+
+def read_freebsd_cpu_stats(cpu_ids: List[int]) -> CPUStats:
+    raw = sysctl_value("kern.cp_times")
+    values = [int(part) for part in re.findall(r"-?\d+", raw or "")]
+    stats: CPUStats = {}
+
+    if len(values) < len(cpu_ids) * 5:
+        return stats
+
+    for index, cpu_id in enumerate(cpu_ids):
+        base = index * 5
+        fields = values[base:base + 5]
+        total = sum(fields)
+        idle = fields[4]
+        stats[cpu_id] = (total, idle)
+
+    return stats
+
+
+def read_cpu_stats(cpu_ids: List[int]) -> CPUStats:
+    system = get_system_name()
+
+    if system == "linux":
+        return read_linux_cpu_stats()
+
+    if system == "darwin":
+        return read_darwin_cpu_stats()
+
+    if system == "freebsd":
+        return read_freebsd_cpu_stats(cpu_ids)
+
+    return {}
+
+
 def calc_cpu_usage(
-    prev_stats: Dict[int, Tuple[int, int]],
-    curr_stats: Dict[int, Tuple[int, int]],
+    prev_stats: CPUStats,
+    curr_stats: CPUStats,
 ) -> Dict[int, Optional[float]]:
     usage: Dict[int, Optional[float]] = {}
     for cpu_id, (curr_total, curr_idle) in curr_stats.items():
@@ -266,16 +591,26 @@ def calc_cpu_usage(
 
 
 def init_colors() -> None:
-    curses.start_color()
-    curses.use_default_colors()
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except curses.error:
+        return
 
-    curses.init_pair(1, curses.COLOR_GREEN, -1)
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)
-    curses.init_pair(3, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(4, curses.COLOR_RED, -1)
-    curses.init_pair(5, curses.COLOR_CYAN, -1)
-    curses.init_pair(6, -1, -1)
-    curses.init_pair(7, curses.COLOR_BLUE, -1)
+    color_pairs = [
+        (1, curses.COLOR_GREEN, -1),
+        (2, curses.COLOR_YELLOW, -1),
+        (3, curses.COLOR_MAGENTA, -1),
+        (4, curses.COLOR_RED, -1),
+        (5, curses.COLOR_CYAN, -1),
+        (6, -1, -1),
+        (7, curses.COLOR_BLUE, -1),
+    ]
+    for pair in color_pairs:
+        try:
+            curses.init_pair(*pair)
+        except curses.error:
+            pass
 
     if curses.COLORS >= 256:
         try:
@@ -312,27 +647,37 @@ def get_cell_width(mode: str, label_w: int) -> int:
     return label_w + 1 + 4 + 2 + 8 + 2 + 8 + 1
 
 
-def collect_data(cpu_dirs: List[str], usages: Dict[int, Optional[float]]) -> Dict[int, CPUEntry]:
+def collect_data(cpu_ids: List[int], usages: Dict[int, Optional[float]]) -> Dict[int, CPUEntry]:
+    freq_map = get_all_freq_info(cpu_ids)
     data: Dict[int, CPUEntry] = {}
-    for cpu_dir in cpu_dirs:
-        idx = int(os.path.basename(cpu_dir)[3:])
-        cur, low, high = get_freq_info(cpu_dir)
-        data[idx] = (idx, cur, low, high, usages.get(idx))
+    for cpu_id in cpu_ids:
+        cur, low, high = freq_map.get(cpu_id, (None, None, None))
+        data[cpu_id] = (cpu_id, cur, low, high, usages.get(cpu_id))
     return data
 
 
-def get_cpu_package_map(cpu_dirs: List[str]) -> Dict[int, int]:
+def get_cpu_package_map(cpu_ids: List[int]) -> Dict[int, int]:
     out: Dict[int, int] = {}
-    for cpu_dir in cpu_dirs:
-        cpu_id = int(os.path.basename(cpu_dir)[3:])
-        pkg = read_int(os.path.join(cpu_dir, "topology", "physical_package_id"))
+
+    if get_system_name() != "linux":
+        return {cpu_id: 0 for cpu_id in cpu_ids}
+
+    _, _, cpuinfo_packages, _ = parse_linux_cpuinfo()
+    for cpu_id in cpu_ids:
+        pkg = read_int(f"/sys/devices/system/cpu/cpu{cpu_id}/topology/physical_package_id")
+        if pkg is None:
+            pkg = cpuinfo_packages.get(cpu_id)
         out[cpu_id] = 0 if pkg is None else pkg
     return out
 
 
 def get_numa_groups(cpu_ids: List[int]) -> List[Tuple[int, List[int]]]:
+    if get_system_name() != "linux":
+        return [(0, cpu_ids)]
+
     node_dirs = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
     groups: List[Tuple[int, List[int]]] = []
+    cpu_set = set(cpu_ids)
 
     for node_dir in node_dirs:
         m = re.search(r"node(\d+)$", node_dir)
@@ -341,14 +686,15 @@ def get_numa_groups(cpu_ids: List[int]) -> List[Tuple[int, List[int]]]:
         node_id = int(m.group(1))
         cpulist = read_text(os.path.join(node_dir, "cpulist"))
         if cpulist:
-            groups.append((node_id, parse_cpu_list(cpulist)))
+            ids = [cpu_id for cpu_id in parse_cpu_list(cpulist) if cpu_id in cpu_set]
+            if ids:
+                groups.append((node_id, ids))
 
     return groups if groups else [(0, cpu_ids)]
 
 
-def get_socket_numa_tree(cpu_dirs: List[str]) -> List[Tuple[int, List[Tuple[int, List[int]]]]]:
-    cpu_ids = get_cpu_ids(cpu_dirs)
-    package_map = get_cpu_package_map(cpu_dirs)
+def get_socket_numa_tree(cpu_ids: List[int]) -> List[Tuple[int, List[Tuple[int, List[int]]]]]:
+    package_map = get_cpu_package_map(cpu_ids)
     numa_groups = get_numa_groups(cpu_ids)
 
     sockets: Dict[int, List[Tuple[int, List[int]]]] = {}
@@ -378,14 +724,25 @@ def compute_avg_freq(entries: List[CPUEntry]) -> Optional[float]:
 
 
 def get_cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.lower().startswith("model name"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return "CPU"
+    system = get_system_name()
+
+    if system == "linux":
+        _, _, _, model = parse_linux_cpuinfo()
+        if model:
+            return model
+
+    if system == "darwin":
+        model = sysctl_value("machdep.cpu.brand_string") or sysctl_value("hw.model")
+        if model:
+            return model
+
+    if system == "freebsd":
+        model = sysctl_value("hw.model")
+        if model:
+            return model
+
+    processor = platform.processor() or platform.machine()
+    return processor or "CPU"
 
 
 def draw_cell(stdscr, y: int, x: int, entry: CPUEntry, mode: str, label_w: int, max_w: int) -> None:
@@ -794,20 +1151,23 @@ def draw_grouped_mode(
 
     return page, total_pages
 
+
 def draw_screen(stdscr, version: str):
-    curses.curs_set(0)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
     stdscr.nodelay(True)
     stdscr.timeout(50)
     init_colors()
 
-    cpu_dirs = get_cpu_dirs()
-    if not cpu_dirs:
+    cpu_ids = get_cpu_ids()
+    if not cpu_ids:
         return
 
-    cpu_ids = get_cpu_ids(cpu_dirs)
     max_cpu_id = max(cpu_ids) if cpu_ids else 0
     label_w = compute_label_width(max_cpu_id)
-    tree = get_socket_numa_tree(cpu_dirs)
+    tree = get_socket_numa_tree(cpu_ids)
     model = get_cpu_model()
     sockets = len(tree)
     nodes = sum(len(node_groups) for _, node_groups in tree)
@@ -815,7 +1175,7 @@ def draw_screen(stdscr, version: str):
     mode, grouping = load_config()
     page = 0
 
-    prev_stats = read_proc_stat()
+    prev_stats = read_cpu_stats(cpu_ids)
     usages: Dict[int, Optional[float]] = {cpu_id: None for cpu_id in cpu_ids}
     data_map: Dict[int, CPUEntry] = {}
     data_list: List[CPUEntry] = []
@@ -824,10 +1184,10 @@ def draw_screen(stdscr, version: str):
     while True:
         now = time.monotonic()
         if now - last_refresh >= REFRESH_SEC:
-            curr_stats = read_proc_stat()
+            curr_stats = read_cpu_stats(cpu_ids)
             usages = calc_cpu_usage(prev_stats, curr_stats)
             prev_stats = curr_stats
-            data_map = collect_data(cpu_dirs, usages)
+            data_map = collect_data(cpu_ids, usages)
             data_list = [data_map[k] for k in sorted(data_map)]
             last_refresh = now
 
@@ -876,8 +1236,9 @@ def main():
         print(f"{APP_NAME} {version}")
         return
 
-    if not get_cpu_dirs():
-        print("No CPU cores found under /sys/devices/system/cpu/")
+    if not get_cpu_ids():
+        system = platform.system() or "this system"
+        print(f"No CPU cores found on {system}.")
         raise SystemExit(1)
 
     curses.wrapper(lambda stdscr: draw_screen(stdscr, version))
