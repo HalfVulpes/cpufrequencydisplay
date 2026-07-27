@@ -1,3 +1,5 @@
+# This project is moved to https://git.leafwolf.net/HalfVulpes/cpufrequencydisplay for latest release and update please visit git.leafwolf.net
+
 # CPU frequency display
 
 Terminal CPU frequency and usage display for Debian, Proxmox VE, Fedora, macOS, and FreeBSD systems, with layout support for large core-count and NUMA-heavy Linux machines.
